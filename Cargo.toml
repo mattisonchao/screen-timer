@@ -1,0 +1,8 @@
+[package]
+name = "screen-timer"
+version = "0.1.0"
+edition = "2024"
+description = "Force screen lock after a set duration to enforce breaks"
+
+[dependencies]
+eframe = "0.31"
