@@ -16,6 +16,7 @@ pub enum IpcCommand {
     SetImage { path: String },
     Unlock,
     Quit,
+    StartPomodoro,
 }
 
 #[derive(Serialize, Deserialize, Debug)]

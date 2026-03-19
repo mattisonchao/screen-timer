@@ -1,9 +1,10 @@
 use clap::{Parser, Subcommand};
 
 mod app;
+mod config;
 mod ipc;
 
-/// Screen Timer — menu bar timer that blocks your screen to enforce breaks.
+/// Screen Timer — menu bar timer to enforce context switching.
 ///
 /// Run without arguments to start the menu bar app.
 /// Use subcommands to control a running instance (e.g. from scripts or agents).
@@ -33,6 +34,8 @@ enum Commands {
     Unlock,
     /// Quit the running daemon
     Quit,
+    /// Start a Pomodoro cycle with saved settings
+    Pomodoro,
 }
 
 fn main() {
@@ -69,6 +72,7 @@ fn main() {
                 Commands::Status => ipc::IpcCommand::Status,
                 Commands::Unlock => ipc::IpcCommand::Unlock,
                 Commands::Quit => ipc::IpcCommand::Quit,
+                Commands::Pomodoro => ipc::IpcCommand::StartPomodoro,
             };
 
             match ipc::send_command(&ipc_cmd) {

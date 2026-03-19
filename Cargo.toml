@@ -1,8 +1,8 @@
 [package]
 name = "screen-timer"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "macOS menu bar timer that locks your screen to enforce breaks"
+description = "macOS menu bar timer to enforce context switching"
 
 [dependencies]
 eframe = "0.31"

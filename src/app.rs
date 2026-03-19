@@ -1,3 +1,4 @@
+use crate::config::{AppConfig, PomodoroConfig};
 use crate::ipc;
 use core_graphics::display::CGDisplay;
 use eframe::egui;
@@ -124,6 +125,7 @@ struct TrayMenuIds {
     start_1h: MenuItem,
     start_1h30m: MenuItem,
     start_2h: MenuItem,
+    start_pomodoro: MenuItem,
     pause_resume: MenuItem,
     stop: MenuItem,
     show_window: MenuItem,
@@ -138,6 +140,16 @@ pub struct App {
     seconds: u32,
     message: String,
     anim_time: f64,
+
+    // Config
+    config: AppConfig,
+    config_dirty: bool,
+
+    // Pomodoro
+    pomodoro_enabled: bool,
+    pomodoro_config: PomodoroConfig,
+    pomodoro_session: u32,
+    pomodoro_in_break: bool,
 
     // Tray
     tray: Option<TrayIcon>,
@@ -161,13 +173,24 @@ pub struct App {
 impl App {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel();
+        let config = AppConfig::load();
         Self {
-            timer: TimerState::new(),
-            hours: 0,
-            minutes: 25,
-            seconds: 0,
+            timer: {
+                let mut t = TimerState::new();
+                t.lockout_secs = config.break_length_secs;
+                t
+            },
+            hours: config.last_hours,
+            minutes: config.last_minutes,
+            seconds: config.last_seconds,
             message: String::new(),
             anim_time: 0.0,
+            pomodoro_enabled: config.pomodoro_enabled,
+            pomodoro_config: config.pomodoro.clone(),
+            pomodoro_session: 0,
+            pomodoro_in_break: false,
+            config,
+            config_dirty: false,
             tray: None,
             tray_ids: None,
             ipc_rx: rx,
@@ -185,7 +208,22 @@ impl App {
         self.hours as u64 * 3600 + self.minutes as u64 * 60 + self.seconds as u64
     }
 
+    fn save_config(&mut self) {
+        self.config.last_hours = self.hours;
+        self.config.last_minutes = self.minutes;
+        self.config.last_seconds = self.seconds;
+        self.config.break_length_secs = self.timer.lockout_secs;
+        self.config.pomodoro_enabled = self.pomodoro_enabled;
+        self.config.pomodoro = self.pomodoro_config.clone();
+        self.config.save();
+        self.config_dirty = false;
+    }
+
     fn start_timer_from_input(&mut self) {
+        if self.pomodoro_enabled {
+            self.start_pomodoro_cycle();
+            return;
+        }
         let total = self.total_input_secs();
         if total < 10 {
             self.message = "Minimum 10 seconds".to_string();
@@ -193,15 +231,92 @@ impl App {
         }
         self.message.clear();
         self.timer.start(total);
+        self.save_config();
+    }
+
+    fn start_pomodoro_cycle(&mut self) {
+        self.pomodoro_enabled = true;
+        self.pomodoro_session = 0;
+        self.pomodoro_in_break = false;
+        self.message.clear();
+        let focus_secs = self.pomodoro_config.focus_minutes as u64 * 60;
+        self.timer.start(focus_secs);
+        notify(
+            "Pomodoro",
+            &format!(
+                "Focus session 1/{} started",
+                self.pomodoro_config.sessions_before_long_break
+            ),
+        );
+        self.save_config();
+    }
+
+    fn handle_timer_expired(&mut self, ctx: &egui::Context) {
+        if self.timer.phase != Phase::Running || self.timer.remaining() > 0 {
+            return;
+        }
+
+        if self.pomodoro_enabled {
+            if self.pomodoro_in_break {
+                // Short break just ended → start next focus session
+                self.pomodoro_session += 1;
+                if self.pomodoro_session >= self.pomodoro_config.sessions_before_long_break {
+                    // Full cycle done → long break via fullscreen BreakScreen
+                    self.timer.lockout_secs = self.pomodoro_config.long_break_minutes as u64 * 60;
+                    self.enter_fullscreen_break(ctx);
+                    self.pomodoro_session = 0;
+                    self.pomodoro_in_break = false;
+                } else {
+                    // Start next focus period
+                    self.pomodoro_in_break = false;
+                    let focus_secs = self.pomodoro_config.focus_minutes as u64 * 60;
+                    self.timer.start(focus_secs);
+                    notify(
+                        "Pomodoro",
+                        &format!(
+                            "Focus session {}/{} started",
+                            self.pomodoro_session + 1,
+                            self.pomodoro_config.sessions_before_long_break
+                        ),
+                    );
+                }
+            } else {
+                // Focus just ended → start short break (in-window, not fullscreen)
+                self.pomodoro_in_break = true;
+                let break_secs = self.pomodoro_config.short_break_minutes as u64 * 60;
+                self.timer.start(break_secs);
+                notify(
+                    "Pomodoro",
+                    &format!("Short break: {}m", self.pomodoro_config.short_break_minutes),
+                );
+            }
+        } else {
+            // Standard mode: enter fullscreen break
+            self.enter_fullscreen_break(ctx);
+        }
+    }
+
+    fn enter_fullscreen_break(&mut self, ctx: &egui::Context) {
+        self.break_image_loaded = false;
+        self.escape_count = 0;
+        self.last_escape_time = None;
+        self.timer.enter_break();
+        self.was_fullscreen = true;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     }
 
     fn handle_ipc_commands(&mut self) {
         while let Ok(cmd) = self.ipc_rx.try_recv() {
             match cmd {
                 ipc::IpcCommand::Start { seconds } => {
+                    self.pomodoro_in_break = false;
                     self.timer.start(seconds);
                 }
                 ipc::IpcCommand::Stop => {
+                    self.pomodoro_in_break = false;
+                    self.pomodoro_session = 0;
                     self.timer.stop();
                 }
                 ipc::IpcCommand::Pause => {
@@ -226,7 +341,12 @@ impl App {
                     }
                 }
                 ipc::IpcCommand::Quit => {
+                    self.save_config();
+                    ipc::cleanup();
                     std::process::exit(0);
+                }
+                ipc::IpcCommand::StartPomodoro => {
+                    self.start_pomodoro_cycle();
                 }
             }
         }
@@ -239,7 +359,20 @@ impl App {
         match self.timer.phase {
             Phase::Running => {
                 let remaining = format_time(self.timer.remaining());
-                let _ = tray.set_title(Some(&format!("  {remaining}")));
+                let suffix = if self.pomodoro_enabled {
+                    if self.pomodoro_in_break {
+                        " BRK".to_string()
+                    } else {
+                        format!(
+                            " F{}/{}",
+                            self.pomodoro_session + 1,
+                            self.pomodoro_config.sessions_before_long_break
+                        )
+                    }
+                } else {
+                    String::new()
+                };
+                let _ = tray.set_title(Some(&format!("  {remaining}{suffix}")));
                 ids.pause_resume.set_text("Pause");
                 ids.pause_resume.set_enabled(true);
                 ids.stop.set_enabled(true);
@@ -248,6 +381,7 @@ impl App {
                 ids.start_1h.set_enabled(false);
                 ids.start_1h30m.set_enabled(false);
                 ids.start_2h.set_enabled(false);
+                ids.start_pomodoro.set_enabled(false);
             }
             Phase::Paused => {
                 let remaining = format_time(self.timer.remaining());
@@ -268,37 +402,60 @@ impl App {
                 ids.start_1h.set_enabled(true);
                 ids.start_1h30m.set_enabled(true);
                 ids.start_2h.set_enabled(true);
+                ids.start_pomodoro.set_enabled(true);
             }
         }
     }
 
     fn handle_tray_events(&mut self, ctx: &egui::Context) {
+        // Collect menu event IDs first to avoid borrow conflict
+        let events: Vec<_> = std::iter::from_fn(|| MenuEvent::receiver().try_recv().ok())
+            .map(|e| e.id().clone())
+            .collect();
+
         let Some(ids) = &self.tray_ids else { return };
 
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            let id = event.id().clone();
-            if id == *ids.start_25m.id() {
+        // Snapshot IDs we need to compare against
+        let id_25m = ids.start_25m.id().clone();
+        let id_45m = ids.start_45m.id().clone();
+        let id_1h = ids.start_1h.id().clone();
+        let id_1h30m = ids.start_1h30m.id().clone();
+        let id_2h = ids.start_2h.id().clone();
+        let id_pom = ids.start_pomodoro.id().clone();
+        let id_pr = ids.pause_resume.id().clone();
+        let id_stop = ids.stop.id().clone();
+        let id_show = ids.show_window.id().clone();
+        let id_quit = ids.quit.id().clone();
+
+        // Drop the borrow on self.tray_ids so we can mutate self
+        for id in events {
+            if id == id_25m {
                 self.timer.start(25 * 60);
-            } else if id == *ids.start_45m.id() {
+            } else if id == id_45m {
                 self.timer.start(45 * 60);
-            } else if id == *ids.start_1h.id() {
+            } else if id == id_1h {
                 self.timer.start(60 * 60);
-            } else if id == *ids.start_1h30m.id() {
+            } else if id == id_1h30m {
                 self.timer.start(90 * 60);
-            } else if id == *ids.start_2h.id() {
+            } else if id == id_2h {
                 self.timer.start(120 * 60);
-            } else if id == *ids.pause_resume.id() {
+            } else if id == id_pom {
+                self.start_pomodoro_cycle();
+            } else if id == id_pr {
                 match self.timer.phase {
                     Phase::Running => self.timer.pause(),
                     Phase::Paused => self.timer.resume(),
                     _ => {}
                 }
-            } else if id == *ids.stop.id() {
+            } else if id == id_stop {
+                self.pomodoro_in_break = false;
+                self.pomodoro_session = 0;
                 self.timer.stop();
-            } else if id == *ids.show_window.id() {
+            } else if id == id_show {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            } else if id == *ids.quit.id() {
+            } else if id == id_quit {
+                self.save_config();
                 ipc::cleanup();
                 std::process::exit(0);
             }
@@ -358,8 +515,8 @@ pub fn run() -> eframe::Result<()> {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([420.0, 560.0])
-            .with_min_inner_size([380.0, 500.0])
+            .with_inner_size([420.0, 620.0])
+            .with_min_inner_size([380.0, 560.0])
             .with_always_on_top(),
         ..Default::default()
     };
@@ -401,18 +558,8 @@ impl eframe::App for App {
         self.handle_ipc_commands();
         self.handle_tray_events(ctx);
 
-        // Timer expired → enter break screen
-        if self.timer.phase == Phase::Running && self.timer.remaining() == 0 {
-            self.break_image_loaded = false; // reload image
-            self.escape_count = 0;
-            self.last_escape_time = None;
-            self.timer.enter_break();
-            // Go fullscreen for break
-            self.was_fullscreen = true;
-            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(true));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        }
+        // Timer expired
+        self.handle_timer_expired(ctx);
 
         // Warning at 60s
         if self.timer.phase == Phase::Running && !self.timer.warned && self.timer.remaining() <= 60
@@ -427,14 +574,13 @@ impl eframe::App for App {
                 let now = Instant::now();
                 if let Some(last) = self.last_escape_time {
                     if now.duration_since(last).as_secs_f64() > ESCAPE_WINDOW_SECS {
-                        self.escape_count = 0; // reset if too slow
+                        self.escape_count = 0;
                     }
                 }
                 self.escape_count += 1;
                 self.last_escape_time = Some(now);
 
                 if self.escape_count >= ESCAPE_COUNT_REQUIRED {
-                    // Emergency unlock!
                     self.timer.phase = Phase::Done;
                     if self.was_fullscreen {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(false));
@@ -464,6 +610,7 @@ impl eframe::App for App {
                 ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             } else {
+                self.save_config();
                 ipc::cleanup();
             }
         }
@@ -487,7 +634,7 @@ impl eframe::App for App {
                         );
                         ui.add_space(4.0);
                         ui.label(
-                            egui::RichText::new("Focus. Then rest.")
+                            egui::RichText::new("Focus. Then switch.")
                                 .size(13.0)
                                 .color(TEXT_DIM),
                         );
@@ -514,75 +661,166 @@ impl eframe::App for App {
 
 impl App {
     fn draw_setup(&mut self, ui: &mut egui::Ui) {
-        // Duration card
-        egui::Frame::new()
-            .fill(BG_CARD)
-            .corner_radius(16.0)
-            .inner_margin(24.0)
-            .show(ui, |ui| {
-                ui.vertical_centered(|ui| {
-                    ui.label(
-                        egui::RichText::new("SET DURATION")
-                            .size(11.0)
-                            .color(TEXT_DIM)
-                            .strong(),
-                    );
-                    ui.add_space(16.0);
-                    ui.horizontal(|ui| {
-                        let avail = ui.available_width();
-                        ui.add_space((avail - 240.0).max(0.0) / 2.0);
-                        styled_spinner(ui, &mut self.hours, "HR", 23);
-                        ui.label(egui::RichText::new(":").size(36.0).color(TEXT_DIM));
-                        styled_spinner(ui, &mut self.minutes, "MIN", 59);
-                        ui.label(egui::RichText::new(":").size(36.0).color(TEXT_DIM));
-                        styled_spinner(ui, &mut self.seconds, "SEC", 59);
-                    });
-                });
-            });
-
-        ui.add_space(16.0);
-
-        // Presets
-        ui.label(egui::RichText::new("QUICK START").size(11.0).color(TEXT_DIM).strong());
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            let avail = ui.available_width();
-            let btn_w = (avail - 40.0) / 5.0;
-            for (label, h, m) in [("25m", 0u32, 25u32), ("45m", 0, 45), ("1h", 1, 0), ("1h30", 1, 30), ("2h", 2, 0)]
-            {
-                let sel = self.hours == h && self.minutes == m && self.seconds == 0;
-                let btn = egui::Button::new(
-                    egui::RichText::new(label)
-                        .size(13.0)
-                        .color(if sel { BG } else { TEXT_PRIMARY }),
-                )
-                .fill(if sel { ACCENT } else { BG_CARD })
-                .corner_radius(10.0)
-                .min_size(egui::vec2(btn_w, 36.0));
-                if ui.add(btn).clicked() {
-                    self.hours = h;
-                    self.minutes = m;
-                    self.seconds = 0;
-                }
-            }
-        });
-
-        ui.add_space(16.0);
-
-        // Break duration
+        // Pomodoro toggle card
         egui::Frame::new()
             .fill(BG_CARD)
             .corner_radius(12.0)
             .inner_margin(egui::Margin::symmetric(16, 12))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Break screen duration").size(13.0).color(TEXT_DIM));
+                    ui.label(
+                        egui::RichText::new("Pomodoro Mode")
+                            .size(14.0)
+                            .color(TEXT_PRIMARY)
+                            .strong(),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(egui::RichText::new("sec").size(12.0).color(TEXT_DIM));
-                        ui.add(egui::DragValue::new(&mut self.timer.lockout_secs).range(5..=300));
+                        if ui.add(egui::Checkbox::without_text(&mut self.pomodoro_enabled)).changed() {
+                            self.config_dirty = true;
+                        }
                     });
                 });
             });
+
+        ui.add_space(8.0);
+
+        if self.pomodoro_enabled {
+            // Pomodoro settings card
+            egui::Frame::new()
+                .fill(BG_CARD)
+                .corner_radius(12.0)
+                .inner_margin(egui::Margin::symmetric(16, 12))
+                .show(ui, |ui| {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Focus").size(12.0).color(TEXT_DIM));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new("min").size(11.0).color(TEXT_DIM));
+                                if ui.add(egui::DragValue::new(&mut self.pomodoro_config.focus_minutes).range(1..=120)).changed() {
+                                    self.config_dirty = true;
+                                }
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Short break").size(12.0).color(TEXT_DIM));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new("min").size(11.0).color(TEXT_DIM));
+                                if ui.add(egui::DragValue::new(&mut self.pomodoro_config.short_break_minutes).range(1..=30)).changed() {
+                                    self.config_dirty = true;
+                                }
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Long break").size(12.0).color(TEXT_DIM));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new("min").size(11.0).color(TEXT_DIM));
+                                if ui.add(egui::DragValue::new(&mut self.pomodoro_config.long_break_minutes).range(1..=60)).changed() {
+                                    self.config_dirty = true;
+                                }
+                            });
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Sessions before long break").size(12.0).color(TEXT_DIM));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add(egui::DragValue::new(&mut self.pomodoro_config.sessions_before_long_break).range(1..=10)).changed() {
+                                    self.config_dirty = true;
+                                }
+                            });
+                        });
+                    });
+                });
+
+            ui.add_space(8.0);
+
+            // Pomodoro cycle summary
+            let total_focus = self.pomodoro_config.focus_minutes * self.pomodoro_config.sessions_before_long_break;
+            let total_short = self.pomodoro_config.short_break_minutes * (self.pomodoro_config.sessions_before_long_break - 1);
+            let total_mins = total_focus + total_short + self.pomodoro_config.long_break_minutes;
+            ui.label(
+                egui::RichText::new(format!(
+                    "Cycle: {}x{}m focus + {}m short breaks + {}m long break = {}m total",
+                    self.pomodoro_config.sessions_before_long_break,
+                    self.pomodoro_config.focus_minutes,
+                    self.pomodoro_config.short_break_minutes,
+                    self.pomodoro_config.long_break_minutes,
+                    total_mins,
+                ))
+                .size(11.0)
+                .color(TEXT_DIM),
+            );
+        } else {
+            // Duration card (only in standard mode)
+            egui::Frame::new()
+                .fill(BG_CARD)
+                .corner_radius(16.0)
+                .inner_margin(24.0)
+                .show(ui, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.label(
+                            egui::RichText::new("SET DURATION")
+                                .size(11.0)
+                                .color(TEXT_DIM)
+                                .strong(),
+                        );
+                        ui.add_space(16.0);
+                        ui.horizontal(|ui| {
+                            let avail = ui.available_width();
+                            ui.add_space((avail - 240.0).max(0.0) / 2.0);
+                            styled_spinner(ui, &mut self.hours, "HR", 23);
+                            ui.label(egui::RichText::new(":").size(36.0).color(TEXT_DIM));
+                            styled_spinner(ui, &mut self.minutes, "MIN", 59);
+                            ui.label(egui::RichText::new(":").size(36.0).color(TEXT_DIM));
+                            styled_spinner(ui, &mut self.seconds, "SEC", 59);
+                        });
+                    });
+                });
+
+            ui.add_space(16.0);
+
+            // Presets
+            ui.label(egui::RichText::new("QUICK START").size(11.0).color(TEXT_DIM).strong());
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                let avail = ui.available_width();
+                let btn_w = (avail - 40.0) / 5.0;
+                for (label, h, m) in [("25m", 0u32, 25u32), ("45m", 0, 45), ("1h", 1, 0), ("1h30", 1, 30), ("2h", 2, 0)]
+                {
+                    let sel = self.hours == h && self.minutes == m && self.seconds == 0;
+                    let btn = egui::Button::new(
+                        egui::RichText::new(label)
+                            .size(13.0)
+                            .color(if sel { BG } else { TEXT_PRIMARY }),
+                    )
+                    .fill(if sel { ACCENT } else { BG_CARD })
+                    .corner_radius(10.0)
+                    .min_size(egui::vec2(btn_w, 36.0));
+                    if ui.add(btn).clicked() {
+                        self.hours = h;
+                        self.minutes = m;
+                        self.seconds = 0;
+                    }
+                }
+            });
+
+            ui.add_space(16.0);
+
+            // Break duration
+            egui::Frame::new()
+                .fill(BG_CARD)
+                .corner_radius(12.0)
+                .inner_margin(egui::Margin::symmetric(16, 12))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Break screen duration").size(13.0).color(TEXT_DIM));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(egui::RichText::new("sec").size(12.0).color(TEXT_DIM));
+                            if ui.add(egui::DragValue::new(&mut self.timer.lockout_secs).range(5..=300)).changed() {
+                                self.config_dirty = true;
+                            }
+                        });
+                    });
+                });
+        }
 
         ui.add_space(8.0);
 
@@ -609,8 +847,13 @@ impl App {
         ui.add_space(20.0);
 
         // Start button
+        let btn_label = if self.pomodoro_enabled {
+            "Start Pomodoro"
+        } else {
+            "Start Focus Session"
+        };
         let btn = egui::Button::new(
-            egui::RichText::new("Start Focus Session")
+            egui::RichText::new(btn_label)
                 .size(18.0)
                 .color(egui::Color32::WHITE)
                 .strong(),
@@ -621,13 +864,20 @@ impl App {
         if ui.add(btn).clicked() {
             self.start_timer_from_input();
         }
+
+        // Save config if dirty (deferred to avoid saving every frame)
+        if self.config_dirty {
+            self.save_config();
+        }
     }
 
     fn draw_timer(&mut self, ui: &mut egui::Ui) {
         let remaining = self.timer.remaining();
         let progress = self.timer.progress();
 
-        let ring_color = if remaining <= 10 {
+        let ring_color = if self.pomodoro_enabled && self.pomodoro_in_break {
+            GREEN
+        } else if remaining <= 10 {
             RED
         } else if remaining <= 60 {
             YELLOW
@@ -663,10 +913,25 @@ impl App {
             egui::FontId::new(48.0, egui::FontFamily::Proportional),
             TEXT_PRIMARY,
         );
+
+        // Subtitle: show context
+        let subtitle = if self.pomodoro_enabled {
+            if self.pomodoro_in_break {
+                "Short Break".to_string()
+            } else {
+                format!(
+                    "Focus {}/{}",
+                    self.pomodoro_session + 1,
+                    self.pomodoro_config.sessions_before_long_break
+                )
+            }
+        } else {
+            format!("of {}", format_time(self.timer.total_secs))
+        };
         painter.text(
             center + egui::vec2(0.0, 24.0),
             egui::Align2::CENTER_CENTER,
-            &format!("of {}", format_time(self.timer.total_secs)),
+            &subtitle,
             egui::FontId::new(13.0, egui::FontFamily::Proportional),
             TEXT_DIM,
         );
@@ -701,7 +966,11 @@ impl App {
 
             let btn = egui::Button::new(egui::RichText::new("Cancel").size(15.0).color(RED))
                 .fill(BG_CARD).corner_radius(12.0).min_size(egui::vec2(btn_w, 44.0));
-            if ui.add(btn).clicked() { self.timer.stop(); }
+            if ui.add(btn).clicked() {
+                self.pomodoro_in_break = false;
+                self.pomodoro_session = 0;
+                self.timer.stop();
+            }
         });
     }
 
@@ -909,6 +1178,7 @@ fn create_tray() -> Result<(TrayIcon, TrayMenuIds), Box<dyn std::error::Error>> 
     let start_1h = MenuItem::new("Start 1h", true, None);
     let start_1h30m = MenuItem::new("Start 1h30m", true, None);
     let start_2h = MenuItem::new("Start 2h", true, None);
+    let start_pomodoro = MenuItem::new("Start Pomodoro", true, None);
     let pause_resume = MenuItem::new("Pause", false, None);
     let stop = MenuItem::new("Stop", false, None);
     let show_window = MenuItem::new("Show Window", true, None);
@@ -919,6 +1189,8 @@ fn create_tray() -> Result<(TrayIcon, TrayMenuIds), Box<dyn std::error::Error>> 
     menu.append(&start_1h)?;
     menu.append(&start_1h30m)?;
     menu.append(&start_2h)?;
+    menu.append(&PredefinedMenuItem::separator())?;
+    menu.append(&start_pomodoro)?;
     menu.append(&PredefinedMenuItem::separator())?;
     menu.append(&pause_resume)?;
     menu.append(&stop)?;
@@ -942,6 +1214,7 @@ fn create_tray() -> Result<(TrayIcon, TrayMenuIds), Box<dyn std::error::Error>> 
             start_1h,
             start_1h30m,
             start_2h,
+            start_pomodoro,
             pause_resume,
             stop,
             show_window,
@@ -951,7 +1224,6 @@ fn create_tray() -> Result<(TrayIcon, TrayMenuIds), Box<dyn std::error::Error>> 
 }
 
 fn create_timer_icon() -> Icon {
-    // Create a simple 22x22 timer icon (circle with hands)
     let size = 22u32;
     let mut rgba = vec![0u8; (size * size * 4) as usize];
 
@@ -966,15 +1238,13 @@ fn create_timer_icon() -> Icon {
             let idx = ((y * size + x) * 4) as usize;
 
             if (dist - radius).abs() < 1.5 {
-                // Circle outline
                 let a = (1.0 - (dist - radius).abs() / 1.5).max(0.0);
                 rgba[idx] = 200;
                 rgba[idx + 1] = 200;
                 rgba[idx + 2] = 220;
                 rgba[idx + 3] = (a * 255.0) as u8;
             } else if dist < radius - 1.0 {
-                // Inside: draw clock hands
-                let angle_h = std::f32::consts::FRAC_PI_4; // ~1:30
+                let angle_h = std::f32::consts::FRAC_PI_4;
                 let hx = angle_h.sin() * radius * 0.45;
                 let hy = -angle_h.cos() * radius * 0.45;
                 let angle_m = std::f32::consts::PI;
@@ -995,7 +1265,6 @@ fn create_timer_icon() -> Icon {
     }
 
     Icon::from_rgba(rgba, size, size).unwrap_or_else(|_| {
-        // Fallback: 1x1 icon
         Icon::from_rgba(vec![200, 200, 220, 255], 1, 1).unwrap()
     })
 }
@@ -1038,12 +1307,10 @@ fn draw_arc(
         .collect();
 
     if points.len() >= 2 {
-        // Glow
         painter.add(egui::Shape::line(
             points.clone(),
             egui::Stroke::new(stroke_width + 6.0, color.gamma_multiply(0.15)),
         ));
-        // Main
         painter.add(egui::Shape::line(
             points,
             egui::Stroke::new(stroke_width, color),
