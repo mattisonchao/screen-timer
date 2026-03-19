@@ -1,8 +1,14 @@
 [package]
 name = "screen-timer"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-description = "Force screen lock after a set duration to enforce breaks"
+description = "macOS menu bar timer that locks your screen to enforce breaks"
 
 [dependencies]
 eframe = "0.31"
+tray-icon = "0.19"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+core-graphics = "0.23"
