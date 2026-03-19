@@ -56,51 +56,41 @@ jobs:
             checksums.txt
 
       - name: Update Homebrew tap
-        if: ${{ secrets.HOMEBREW_TAP_TOKEN != '' }}
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
         run: |
-          SHA=$(shasum -a 256 screen-timer-${{ github.ref_name }}-macos-universal.tar.gz | awk '{print $1}')
-          VERSION=${{ github.ref_name }}
-          DOWNLOAD_URL="https://github.com/mattisonchao/screen-timer/releases/download/${VERSION}/screen-timer-${VERSION}-macos-universal.tar.gz"
+          if [ -z "${GH_TOKEN}" ]; then
+            echo "HOMEBREW_TAP_TOKEN not set, skipping tap update"
+            exit 0
+          fi
 
-          FORMULA=$(cat <<RUBY
+          SHA=$(shasum -a 256 screen-timer-${{ github.ref_name }}-macos-universal.tar.gz | awk '{print $1}')
+          VERSION="${{ github.ref_name }}"
+          URL="https://github.com/mattisonchao/screen-timer/releases/download/${VERSION}/screen-timer-${VERSION}-macos-universal.tar.gz"
+
+          git clone "https://x-access-token:${GH_TOKEN}@github.com/mattisonchao/homebrew-tap.git" /tmp/homebrew-tap
+          mkdir -p /tmp/homebrew-tap/Formula
+
+          cat > /tmp/homebrew-tap/Formula/screen-timer.rb << EOF
           class ScreenTimer < Formula
             desc "macOS menu bar timer to enforce context switching"
             homepage "https://github.com/mattisonchao/screen-timer"
-            url "${DOWNLOAD_URL}"
+            url "${URL}"
             sha256 "${SHA}"
 
             def install
               bin.install "screen-timer"
             end
 
-            def caveats
-              <<~EOS
-                To start screen-timer as a menu bar app:
-                  screen-timer
-
-                To control via CLI:
-                  screen-timer start 25m
-                  screen-timer pomodoro
-                  screen-timer status
-              EOS
-            end
-
             test do
               assert_match version.to_s, shell_output("#{bin}/screen-timer --version")
             end
           end
-          RUBY
-          )
+          EOF
 
-          # Clone the tap repo and update the formula
-          git clone "https://x-access-token:${GH_TOKEN}@github.com/mattisonchao/homebrew-tap.git" /tmp/homebrew-tap || true
-          if [ -d /tmp/homebrew-tap ]; then
-            mkdir -p /tmp/homebrew-tap/Formula
-            echo "${FORMULA}" > /tmp/homebrew-tap/Formula/screen-timer.rb
-            cd /tmp/homebrew-tap
-            git add Formula/screen-timer.rb
-            git commit -m "Update screen-timer to ${VERSION}" || true
-            git push || true
-          fi
+          cd /tmp/homebrew-tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/screen-timer.rb
+          git commit -m "Update screen-timer to ${VERSION}"
+          git push
